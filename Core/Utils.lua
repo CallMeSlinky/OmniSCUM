@@ -279,3 +279,9 @@ function OmniSCUM.Utils:FormatTime(totalSeconds)
         return table.concat(parts, ", ") .. ", and " .. lastItem
     end
 end
+
+function OmniSCUM.Utils:FormatTimeShort(totalSeconds)
+    local hours = math.floor(totalSeconds / 3600)
+    local minutes = math.floor((totalSeconds % 3600) / 60)
+    return string.format("%d:%02d", hours, minutes)
+end

@@ -1,19 +1,26 @@
 local ConfigModule = require("BountyConfig")
 local Config = ConfigModule.Bounty
+local JSON = require("json")
 
 local BountyAddon = {
     Name = "Bounty",
     Data = nil,
-    FilePath = nil,
     Core = nil,
     Utils = nil,
+    DB = nil
 }
 
 function BountyAddon:Initialize(core)
     self.Core = core
     self.Utils = core.Utils
-    self.FilePath = self.Core.RootSaveFolder .. "Bounty.json"
+    self.DB = core.Database
 
+    if not self.DB then
+        self:Printf(false, "FATAL: Database connection not available. Bounty addon cannot start.")
+        return
+    end
+
+    self:InitializeDatabaseSchema()
     self:LoadData()
     self:InitializeHooks()
     self:StartSaveTimer()
@@ -21,29 +28,198 @@ function BountyAddon:Initialize(core)
     self:StartLocationUpdateTimer()
 end
 
+function BountyAddon:InitializeDatabaseSchema()
+    local sql = [[
+        CREATE TABLE IF NOT EXISTS bounties (
+            target_user_id TEXT PRIMARY KEY NOT NULL,
+            target_name TEXT NOT NULL,
+            reward_cash INTEGER DEFAULT 0,
+            reward_gold INTEGER DEFAULT 0,
+            reward_fame INTEGER DEFAULT 0,
+            creation_timestamp INTEGER NOT NULL,
+            last_seen_timestamp INTEGER,
+            last_seen_sector TEXT,
+            last_seen_keypad TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS bounty_placers (
+            bounty_target_user_id TEXT NOT NULL,
+            placer_user_id TEXT NOT NULL,
+            placer_name TEXT NOT NULL,
+            contribution_cash INTEGER DEFAULT 0,
+            contribution_gold INTEGER DEFAULT 0,
+            contribution_fame INTEGER DEFAULT 0,
+            PRIMARY KEY (bounty_target_user_id, placer_user_id),
+            FOREIGN KEY (bounty_target_user_id) REFERENCES bounties(target_user_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_refunds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            placer_user_id TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            refund_cash INTEGER DEFAULT 0,
+            refund_gold INTEGER DEFAULT 0,
+            refund_fame INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS placer_cooldowns (
+            placer_user_id TEXT PRIMARY KEY NOT NULL,
+            last_new_bounty_timestamp INTEGER,
+            last_placement_per_target_json TEXT
+        );
+    ]]
+
+    local success, err = pcall(function() self.DB:exec(sql) end)
+    if not success then
+        self:Printf(false, "ERROR: Failed to create database schema: %s", tostring(err))
+    else
+        self:Printf(false, "Database schema verified/created successfully.")
+    end
+end
+
 function BountyAddon:GetMessage(key, replacements)
     return self.Utils:GetMessage(Config.Messages, key, replacements, function(...) self:Printf(...) end)
 end
 
 function BountyAddon:SaveData()
-    self.Utils:SaveJSON(self.FilePath, self.Data, function(...) self:Printf(...) end)
+    local success, err = pcall(function()
+        self.DB:exec('BEGIN')
+
+        self.DB:exec(
+            'DELETE FROM bounty_placers; DELETE FROM bounties; DELETE FROM pending_refunds; DELETE FROM placer_cooldowns;')
+
+        local bounty_stmt = self.DB:prepare('INSERT INTO bounties VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        local placer_stmt = self.DB:prepare('INSERT INTO bounty_placers VALUES (?, ?, ?, ?, ?, ?)')
+        local refund_stmt = self.DB:prepare(
+            'INSERT INTO pending_refunds (placer_user_id, target_name, refund_cash, refund_gold, refund_fame) VALUES (?, ?, ?, ?, ?)')
+        local cooldown_stmt = self.DB:prepare('INSERT INTO placer_cooldowns VALUES (?, ?, ?)')
+
+        -- Save Active Bounties
+        for targetId, bounty in pairs(self.Data.ActiveBounties) do
+            bounty_stmt:bind_values(
+                bounty.TargetUserId, bounty.TargetName, bounty.Rewards.cash, bounty.Rewards.gold, bounty.Rewards.fame,
+                bounty.CreationTimestamp, (bounty.LastSeen and bounty.LastSeen.Timestamp) or nil,
+                (bounty.LastSeen and bounty.LastSeen.Sector) or nil, (bounty.LastSeen and bounty.LastSeen.Keypad) or nil
+            )
+            bounty_stmt:step()
+            bounty_stmt:reset()
+
+            for placerId, placer in pairs(bounty.Placers) do
+                placer_stmt:bind_values(
+                    targetId, placer.PlacerUserId, placer.PlacerName,
+                    placer.Contributions.cash, placer.Contributions.gold, placer.Contributions.fame
+                )
+                placer_stmt:step()
+                placer_stmt:reset()
+            end
+        end
+
+        -- Save Pending Refunds
+        for placerId, refunds in pairs(self.Data.PendingRefunds) do
+            for _, refund in ipairs(refunds) do
+                refund_stmt:bind_values(
+                    placerId, refund.targetName,
+                    refund.amount.cash, refund.amount.gold, refund.amount.fame
+                )
+                refund_stmt:step()
+                refund_stmt:reset()
+            end
+        end
+
+        -- Save Placer Cooldowns
+        for placerId, data in pairs(self.Data.PlacerData) do
+            cooldown_stmt:bind_values(
+                placerId, data.lastNewBountyTimestamp, JSON.encode(data.lastPlacementPerTarget or {})
+            )
+            cooldown_stmt:step()
+            cooldown_stmt:reset()
+        end
+
+        -- Finalize statements
+        bounty_stmt:finalize()
+        placer_stmt:finalize()
+        refund_stmt:finalize()
+        cooldown_stmt:finalize()
+
+        self.DB:exec('COMMIT')
+    end)
+
+    if not success then
+        self:Printf(false, "ERROR: Failed to save data to database: %s", tostring(err))
+        self.DB:exec('ROLLBACK')
+    else
+        self:Printf(false, "Bounty data saved to database successfully.")
+    end
 end
 
-
 function BountyAddon:LoadData()
-    local data = self.Utils:LoadJSON(self.FilePath, function(...) self:Printf(...) end)
+    self.Data = {
+        ActiveBounties = {},
+        PendingRefunds = {},
+        PlacerData = {}
+    }
 
-    if not data then
-        self:Printf(false, "Bounty.json not found. A new one will be created.")
-        self.Data = {}
+    local success, err = pcall(function()
+        -- Load Bounties
+        for row in self.DB:nrows('SELECT * FROM bounties') do
+            self.Data.ActiveBounties[row.target_user_id] = {
+                TargetUserId = row.target_user_id,
+                TargetName = row.target_name,
+                Rewards = { cash = row.reward_cash or 0, gold = row.reward_gold or 0, fame = row.reward_fame or 0 },
+                Placers = {},
+                CreationTimestamp = row.creation_timestamp,
+                LastSeen = (row.last_seen_timestamp and {
+                    Timestamp = row.last_seen_timestamp,
+                    Sector = row.last_seen_sector,
+                    Keypad = row.last_seen_keypad
+                }) or nil
+            }
+        end
+
+        -- Load Placers and attach to bounties
+        for row in self.DB:nrows('SELECT * FROM bounty_placers') do
+            local bounty = self.Data.ActiveBounties[row.bounty_target_user_id]
+            if bounty then
+                bounty.Placers[row.placer_user_id] = {
+                    PlacerUserId = row.placer_user_id,
+                    PlacerName = row.placer_name,
+                    Contributions = { cash = row.contribution_cash or 0, gold = row.contribution_gold or 0, fame = row.contribution_fame or 0 }
+                }
+            end
+        end
+
+        -- Load Pending Refunds
+        for row in self.DB:nrows('SELECT * FROM pending_refunds') do
+            self.Data.PendingRefunds[row.placer_user_id] = self.Data.PendingRefunds[row.placer_user_id] or {}
+            table.insert(self.Data.PendingRefunds[row.placer_user_id], {
+                targetName = row.target_name,
+                amount = { cash = row.refund_cash or 0, gold = row.refund_gold or 0, fame = row.refund_fame or 0 }
+            })
+        end
+
+        -- Load Placer Cooldowns
+        for row in self.DB:nrows('SELECT * FROM placer_cooldowns') do
+            local placementData = nil
+            local success_decode, decoded_value = pcall(JSON.decode, row.last_placement_per_target_json or "{}")
+
+            if success_decode and type(decoded_value) == "table" then
+                placementData = decoded_value
+            else
+                placementData = {}
+            end
+
+            self.Data.PlacerData[row.placer_user_id] = {
+                lastNewBountyTimestamp = row.last_new_bounty_timestamp,
+                lastPlacementPerTarget = placementData
+            }
+        end
+    end)
+
+    if not success then
+        self:Printf(false, "ERROR: Failed to load data from database: %s", tostring(err))
     else
-        self.Data = data
-        self:Printf(false, "Bounty data loaded successfully.")
+        self:Printf(false, "Bounty data loaded from database successfully.")
     end
-
-    self.Data.ActiveBounties = self.Data.ActiveBounties or {}
-    self.Data.PendingRefunds = self.Data.PendingRefunds or {}
-    self.Data.PlacerData = self.Data.PlacerData or {}
 end
 
 function BountyAddon:InitializeHooks()
@@ -194,11 +370,13 @@ end
 function BountyAddon:ValidateRateLimiting(placerController, targetUserId)
     if not Config.RateLimiting or placerController:IsUserAdmin() then return true end
 
+    local placerUserId = placerController:GetUserId():ToString()
+
     local isUpdate = self.Data.ActiveBounties[targetUserId] and
-        self.Data.ActiveBounties[targetUserId].Placers[placerController:GetUserId():ToString()]
+        self.Data.ActiveBounties[targetUserId].Placers[placerUserId]
 
     if not isUpdate and Config.RateLimiting.EnableMaxActiveBounties then
-        if self:CountBountiesPlacedBy(placerController:GetUserId():ToString()) >= Config.RateLimiting.MaxActiveBounties then
+        if self:CountBountiesPlacedBy(placerUserId) >= Config.RateLimiting.MaxActiveBounties then
             self.Utils:SendClientHUDMessage(placerController,
                 self:GetMessage("HudMaxBounties", { maxBounties = Config.RateLimiting.MaxActiveBounties }))
             return false
@@ -206,9 +384,10 @@ function BountyAddon:ValidateRateLimiting(placerController, targetUserId)
     end
 
     if Config.RateLimiting.EnableCooldowns then
-        self.Data.PlacerData[placerController:GetUserId():ToString()] = self.Data.PlacerData
-            [placerController:GetUserId():ToString()] or { lastPlacementPerTarget = {} }
-        local placerData = self.Data.PlacerData[placerController:GetUserId():ToString()]
+        if type(self.Data.PlacerData[placerUserId]) ~= "table" then
+            self.Data.PlacerData[placerUserId] = { lastPlacementPerTarget = {} }
+        end
+        local placerData = self.Data.PlacerData[placerUserId]
 
         if isUpdate then
             local timePassed = os.time() - (placerData.lastPlacementPerTarget[targetUserId] or 0)
@@ -290,33 +469,39 @@ function BountyAddon:UpdateBountyData(placerController, targetInfo, amount, lowe
     local targetUserId = targetInfo.targetUserId
 
     local isNewBounty = not self.Data.ActiveBounties[targetUserId]
+    local isUpdateForPlacer = (not isNewBounty) and self.Data.ActiveBounties[targetUserId].Placers[placerUserId]
+
     if isNewBounty then
         self.Data.ActiveBounties[targetUserId] = {
             TargetName = targetInfo.targetName,
             TargetUserId = targetUserId,
             Rewards = { cash = 0, gold = 0, fame = 0 },
             Placers = {},
-            CreationTimestamp =
-                os.time()
+            CreationTimestamp = os.time()
         }
     end
 
     local bounty = self.Data.ActiveBounties[targetUserId]
-    bounty.TargetName = targetInfo.targetName
+    bounty.TargetName = targetInfo.targetName -- Update name in case of change
     bounty.Rewards[lowerCurrency] = (bounty.Rewards[lowerCurrency] or 0) + amount
 
     if not bounty.Placers[placerUserId] then
         bounty.Placers[placerUserId] = { PlacerName = placerName, PlacerUserId = placerUserId, Contributions = { cash = 0, gold = 0, fame = 0 } }
     end
-    bounty.Placers[placerUserId].PlacerName = placerName
+    bounty.Placers[placerUserId].PlacerName = placerName -- Update name in case of change
     bounty.Placers[placerUserId].Contributions[lowerCurrency] = (bounty.Placers[placerUserId].Contributions[lowerCurrency] or 0) +
-        amount
+    amount
 
-    self.Data.PlacerData[placerUserId] = self.Data.PlacerData[placerUserId] or { lastPlacementPerTarget = {} }
-    local isUpdate = not isNewBounty and self.Data.ActiveBounties[targetUserId].Placers[placerUserId]
+    if type(self.Data.PlacerData[placerUserId]) ~= "table" then
+        self.Data.PlacerData[placerUserId] = { lastPlacementPerTarget = {} }
+    end
+
     local currentTime = os.time()
     self.Data.PlacerData[placerUserId].lastPlacementPerTarget[targetUserId] = currentTime
-    if not isUpdate then self.Data.PlacerData[placerUserId].lastNewBountyTimestamp = currentTime end
+
+    if not isUpdateForPlacer then
+        self.Data.PlacerData[placerUserId].lastNewBountyTimestamp = currentTime
+    end
 
     local totalBountyStr = self:FormatBountyString(bounty.Rewards)
     local messageKey
@@ -788,6 +973,7 @@ end
 
 function BountyAddon:UpdateBountyLocations()
     if not (self.Data and self.Data.ActiveBounties) then return end
+    local dataWasChanged = false
 
     ExecuteInGameThread(function()
         for userId, bounty in pairs(self.Data.ActiveBounties) do
@@ -802,6 +988,8 @@ function BountyAddon:UpdateBountyLocations()
                     bounty.LastSeen.Keypad = keypad
                     bounty.LastSeen.Timestamp = os.time()
 
+                    dataWasChanged = true
+
                     if isFirstUpdate then
                         local updateIntervalMinutes = Config.LocationTracking.UpdateIntervalMinutes or 5
                         local updateIntervalSeconds = updateIntervalMinutes * 60
@@ -815,7 +1003,58 @@ function BountyAddon:UpdateBountyLocations()
                 end
             end
         end
+        if dataWasChanged then
+            self:SaveData()
+        end
     end)
+end
+
+function BountyAddon:GetBountyDataForAPI()
+    local bounties = {}
+    local sql = [[
+        SELECT
+            target_user_id,
+            target_name,
+            reward_cash,
+            reward_gold,
+            reward_fame,
+            last_seen_sector,
+            last_seen_keypad
+        FROM bounties
+        ORDER BY (reward_cash + reward_gold + reward_fame) DESC
+    ]]
+
+    local success, err = pcall(function()
+        for row in self.DB:nrows(sql) do
+            local bountyData = {
+                targetUserId = row.target_user_id,
+                targetName = row.target_name,
+                rewards = {
+                    cash = row.reward_cash,
+                    gold = row.reward_gold,
+                    fame = row.reward_fame
+                }
+            }
+
+            if Config.LocationTracking and Config.LocationTracking.Enabled then
+                if Config.LocationTracking.ShowSector and row.last_seen_sector then
+                    bountyData.lastSeenSector = row.last_seen_sector
+                end
+
+                if Config.LocationTracking.ShowKeypad and row.last_seen_keypad then
+                    bountyData.lastSeenKeypad = row.last_seen_keypad
+                end
+            end
+            table.insert(bounties, bountyData)
+        end
+    end)
+
+    if not success then
+        self:Printf(true, "Error fetching bounty data for API: %s", tostring(err))
+        return nil
+    end
+
+    return bounties
 end
 
 if Config.AddonEnabled then

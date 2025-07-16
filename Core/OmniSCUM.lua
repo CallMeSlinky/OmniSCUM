@@ -3,6 +3,7 @@ OmniSCUM = OmniSCUM or {
     RootSaveFolder = nil,
     RootLogFolder = nil,
     Utils = nil,
+    Database = nil,
     RegisteredCommands = {},
     RegisteredHooks = {},
 }
@@ -29,6 +30,15 @@ function OmniSCUM:InitializeCore()
     print("[OmniSCUM] Initializing Core...")
 
     self:SetupDirectories()
+
+    local dbPath = self.RootSaveFolder .. "OmniSCUM.db"
+    self.Database = self.Utils:GetDatabaseConnection(dbPath, function(...) self:Printf("[OmniSCUM::DB]", ...) end)
+    
+    if not self.Database then
+        self:Printf("[OmniSCUM]", "CRITICAL: Database initialization failed. OmniSCUM cannot continue.")
+        return
+    end
+
     self:InitializeAddons()
     self:InitializeHookDispatchers()
 

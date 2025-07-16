@@ -1,5 +1,6 @@
 local UEHelpers = require("UEHelpers")
 local JSON = require("json")
+local sqlite3 = require("lsqlite3complete")
 
 OmniSCUM.Utils = OmniSCUM.Utils or {}
 
@@ -61,6 +62,24 @@ function OmniSCUM.Utils:GetRootSaveDirectory()
     end
     
     return savedDir
+end
+
+function OmniSCUM.Utils:GetDatabaseConnection(dbPath, printFunc)
+    local db, err = sqlite3.open(dbPath)
+    if not db then
+        if printFunc then printFunc(false, "FATAL: Could not open database: %s", tostring(err)) end
+        return nil
+    end
+
+    db:busy_timeout(5000)
+
+    local ok, exec_err = pcall(function() db:exec("PRAGMA foreign_keys = ON;") end)
+    if not ok then
+        if printFunc then printFunc(false, "WARNING: Could not enable foreign keys: %s", tostring(exec_err)) end
+    end
+    
+    if printFunc then printFunc(false, "Database connection successful: %s", dbPath) end
+    return db
 end
 
 function OmniSCUM.Utils:SaveJSON(filePath, data, printFunc)

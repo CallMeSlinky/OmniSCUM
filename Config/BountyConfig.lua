@@ -149,7 +149,7 @@ Config.Bounty = {
         BountyClaimed                 = "{killerName} has claimed the bounty on {targetName} for: {bounty}!",
         BountyExpired                 = "The bounty on {targetName} has expired. The total was: {bounty}",
         BountyExpiredWithReward       = "The bounty on {targetName} has expired. They have been rewarded: {bounty}",
-        TargetConnected               = "Heads up! {targetName}, who has a bounty of {bounty}, has just connected!",
+        TargetConnected               = "Heads up! {targetName}, who has a bounty of {bounty} has just connected!",
         TargetDisconnected            = "{targetName}, who had a bounty of {bounty}, has disconnected!",
         AnnounceLocationExposed       =
         "{targetName}'s position has been exposed! Their last position will update every {updateInterval}. Happy hunting!",
